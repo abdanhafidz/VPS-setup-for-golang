@@ -1,0 +1,262 @@
+name: Deploy and Setup VPS Infrastructure
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Install basic infrastructure
+        run: |
+          ssh -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USERNAME }}@${{ secrets.SSH_HOST }} 'bash -s' << 'ENDSSH'
+          # Update the system
+          echo "Updating system packages..."
+          sudo apt-get update
+          sudo apt-get upgrade -y
+
+          # 1. Install security tools
+          echo "Installing security tools..."
+          sudo apt-get install -y ufw fail2ban unattended-upgrades
+          
+          # Configure firewall
+          sudo ufw default deny incoming
+          sudo ufw default allow outgoing
+          sudo ufw allow ${{ secrets.SSH_PORT }}/tcp
+          sudo ufw allow 80/tcp
+          sudo ufw allow 443/tcp
+          sudo ufw --force enable
+          
+          # Configure fail2ban
+          sudo systemctl enable fail2ban
+          sudo systemctl start fail2ban
+          
+          # Configure unattended-upgrades
+          sudo dpkg-reconfigure -plow unattended-upgrades
+          
+          # 2. Install Nginx
+          echo "Installing Nginx..."
+          sudo apt-get install -y nginx
+          sudo systemctl enable nginx
+          sudo systemctl start nginx
+          
+          # 3. Install Docker
+          echo "Installing Docker..."
+          sudo apt-get install -y apt-transport-https ca-certificates curl software-properties-common
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo apt-key add -
+          sudo add-apt-repository "deb [arch=amd64] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable"
+          sudo apt-get update
+          sudo apt-get install -y docker-ce docker-ce-cli containerd.io
+          sudo systemctl enable docker
+          sudo systemctl start docker
+          
+          # Add current user to docker group
+          sudo usermod -aG docker $USER
+          
+          # 4. Install Docker Compose
+          echo "Installing Docker Compose..."
+          sudo curl -L "https://github.com/docker/compose/releases/download/v2.20.3/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose
+          sudo chmod +x /usr/local/bin/docker-compose
+          
+          # 5. Install SSL Let's Encrypt (Certbot)
+          echo "Installing Certbot for Let's Encrypt..."
+          sudo apt-get install -y certbot python3-certbot-nginx
+          
+          # 6. Install monitoring tools
+          echo "Installing monitoring tools..."
+          # Install cAdvisor for Docker container monitoring
+          sudo docker run -d \
+            --name=cadvisor \
+            --restart=always \
+            --volume=/:/rootfs:ro \
+            --volume=/var/run:/var/run:ro \
+            --volume=/sys:/sys:ro \
+            --volume=/var/lib/docker/:/var/lib/docker:ro \
+            --volume=/dev/disk/:/dev/disk:ro \
+            --publish=8080:8080 \
+            gcr.io/cadvisor/cadvisor:latest
+          
+          # Install Netdata for real-time system monitoring
+          echo "Installing Netdata..."
+          bash <(curl -Ss https://my-netdata.io/kickstart.sh) --dont-wait
+          
+          # Create app directory if it doesn't exist
+          mkdir -p ~/api
+          
+          echo "Infrastructure setup complete!"
+          ENDSSH
+
+      - name: Copy app files
+        run: |
+          # Copy the application files to the server
+          scp -P ${{ secrets.SSH_PORT }} -r ./* ${{ secrets.SSH_USERNAME }}@${{ secrets.SSH_HOST }}:~/api/
+
+      - name: Setup Nginx reverse proxy
+        run: |
+          ssh -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USERNAME }}@${{ secrets.SSH_HOST }} 'bash -s' << 'ENDSSH'
+          # Remove default Nginx config
+          sudo rm -f /etc/nginx/sites-enabled/default
+          
+          # Create Nginx configuration as reverse proxy for the API
+          cat << EOF | sudo tee /etc/nginx/sites-available/api.conf
+          server {
+              listen 80;
+              server_name YOUR_DOMAIN;
+              
+              location / {
+                  proxy_pass http://localhost:8000; # Assuming your API runs on port 8000
+                  proxy_http_version 1.1;
+                  proxy_set_header Upgrade \$http_upgrade;
+                  proxy_set_header Connection 'upgrade';
+                  proxy_set_header Host \$host;
+                  proxy_set_header X-Real-IP \$remote_addr;
+                  proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto \$scheme;
+              }
+          }
+          EOF
+          
+          # Enable the configuration
+          sudo ln -s /etc/nginx/sites-available/api.conf /etc/nginx/sites-enabled/
+          sudo nginx -t && sudo systemctl reload nginx
+          
+          # Create script to set up SSL with Let's Encrypt
+          cat << 'EOF' > ~/setup-ssl.sh
+          #!/bin/bash
+          
+          # Replace YOUR_DOMAIN with your actual domain
+          DOMAIN="YOUR_DOMAIN"
+          EMAIL="your-email@example.com"
+          
+          # Obtain SSL certificate
+          sudo certbot --nginx -d $DOMAIN --non-interactive --agree-tos -m $EMAIL
+          
+          echo "SSL certificate installed for $DOMAIN"
+          EOF
+          
+          chmod +x ~/setup-ssl.sh
+          
+          echo "Nginx reverse proxy configured. Update YOUR_DOMAIN in /etc/nginx/sites-available/api.conf"
+          echo "Then run ~/setup-ssl.sh after updating domain values inside the script"
+          ENDSSH
+
+      - name: Create deployment scripts
+        run: |
+          ssh -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USERNAME }}@${{ secrets.SSH_HOST }} 'bash -s' << 'ENDSSH'
+          # Create deployment script
+          cat << 'EOF' > ~/api/deploy.sh
+          #!/bin/bash
+          
+          cd ~/api
+          
+          # Pull the latest code if it's a git repository
+          if [ -d .git ]; then
+            git pull
+          fi
+          
+          # Stop running containers
+          docker-compose down
+          
+          # Build and start containers
+          docker-compose up -d
+          
+          # Prune unused images
+          docker image prune -f
+          
+          echo "Deployment completed!"
+          EOF
+          
+          # Make the script executable
+          chmod +x ~/api/deploy.sh
+          
+          # Create backup script for database
+          cat << 'EOF' > ~/api/backup-db.sh
+          #!/bin/bash
+          
+          # Directory to store backups
+          BACKUP_DIR=~/backups
+          mkdir -p $BACKUP_DIR
+          
+          # Get current date for filename
+          DATE=$(date +%Y-%m-%d_%H-%M-%S)
+          
+          # Database container name (adjust if different)
+          DB_CONTAINER=postgres
+          
+          # Database credentials (should match your docker-compose.yml)
+          DB_NAME=your_db_name
+          DB_USER=your_db_user
+          
+          # Create backup
+          docker exec $DB_CONTAINER pg_dump -U $DB_USER $DB_NAME > $BACKUP_DIR/backup_$DATE.sql
+          
+          # Compress backup
+          gzip $BACKUP_DIR/backup_$DATE.sql
+          
+          # Remove backups older than 7 days
+          find $BACKUP_DIR -name "backup_*.sql.gz" -mtime +7 -delete
+          
+          echo "Database backup completed: $BACKUP_DIR/backup_$DATE.sql.gz"
+          EOF
+          
+          # Make the backup script executable
+          chmod +x ~/api/backup-db.sh
+          
+          # Create monitoring script
+          cat << 'EOF' > ~/api/monitor.sh
+          #!/bin/bash
+          
+          echo "==== Docker Containers Status ===="
+          docker ps
+          
+          echo -e "\n==== System Resources ===="
+          echo "CPU Load:"
+          uptime
+          
+          echo -e "\nMemory Usage:"
+          free -h
+          
+          echo -e "\nDisk Usage:"
+          df -h /
+          
+          echo -e "\n==== Docker Stats ===="
+          docker stats --no-stream
+          EOF
+          
+          chmod +x ~/api/monitor.sh
+          
+          # Create crontab for automated backups (every day at 2 AM)
+          (crontab -l 2>/dev/null; echo "0 2 * * * ~/api/backup-db.sh >> ~/backup.log 2>&1") | crontab -
+          
+          echo "Deployment and utility scripts created!"
+          echo "Please update database credentials in backup-db.sh"
+          ENDSSH
+
+      - name: Run initial deployment
+        run: |
+          ssh -p ${{ secrets.SSH_PORT }} ${{ secrets.SSH_USERNAME }}@${{ secrets.SSH_HOST }} 'bash -s' << 'ENDSSH'
+          cd ~/api
+          
+          # Check if docker-compose.yml exists
+          if [ -f docker-compose.yml ]; then
+            # Run the deployment script
+            ./deploy.sh
+            
+            echo "Initial deployment completed!"
+          else
+            echo "Warning: docker-compose.yml not found. Skipping initial deployment."
+            echo "Make sure your docker-compose.yml file is properly copied to the ~/api directory."
+          fi
+          ENDSSH
